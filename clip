@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # clip — сниппеты из ~/clip в буфер обмена.
 #
-#   clip              выбрать файл из меню и скопировать в буфер
-#   clip all          склеить все файлы папки в буфер (по алфавиту)
-#   clip last         скопировать самый свежий файл (без меню)
-#   clip 2            скопировать файл №2 из списка (свежие сверху)
-#   clip имя.txt      скопировать конкретный файл по имени
+#   clip              меню: файлы и папки из ~/clip → в буфер
+#   clip all          склеить ВСЁ (включая подпапки) в буфер
+#   clip last         самый свежий файл без меню
+#   clip 2            элемент №2 из списка меню (папки, потом файлы)
+#   clip имя          файл по имени; папка — склеит всё её содержимое
 #   clip save [имя]   сохранить содержимое буфера в новый файл (clip-ДАТА.txt)
 #
 # Папка по умолчанию: ~/clip (меняется через CLIP_DIR).
@@ -28,6 +28,23 @@ from_clip() {
   else echo "clip: нет wl-paste или xclip" >&2; exit 1; fi
 }
 
+# все файлы под папкой: рекурсивно, по алфавиту, без скрытых
+list_files() { find "$1" -type f ! -name '.*' | sort; }
+
+# склеить файлы (или содержимое папки целиком) в буфер
+copy_paths() {
+  local files=() f p
+  for p in "$@"; do
+    if [ -d "$p" ]; then
+      while IFS= read -r f; do files+=("$f"); done < <(list_files "$p")
+    else
+      files+=("$p")
+    fi
+  done
+  if [ "${#files[@]}" -eq 0 ]; then notify "clip" "нечего копировать"; return 0; fi
+  { for f in "${files[@]}"; do cat "$f"; printf '\n'; done; } | to_clip
+}
+
 if [ "${1:-}" = "save" ]; then
   name="${2:-clip-$(date +%Y%m%d-%H%M%S).txt}"
   from_clip > "$DIR/$name"
@@ -35,53 +52,83 @@ if [ "${1:-}" = "save" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "all" ]; then
-  mapfile -t allf < <(find "$DIR" -maxdepth 1 -type f ! -name '.*' | sort)
-  if [ "${#allf[@]}" -eq 0 ]; then notify "clip" "папка пуста: $DIR"; exit 0; fi
-  { for f in "${allf[@]}"; do cat "$f"; printf '\n'; done; } | to_clip
-  notify "clip" "склеено файлов: ${#allf[@]}"
-  exit 0
-fi
+# элементы: папки (по алфавиту) + файлы корня (свежие сверху)
+mapfile -t dirs  < <(find "$DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort)
+mapfile -t files < <(find "$DIR" -mindepth 1 -maxdepth 1 -type f ! -name '.*' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
 
-# файлы папки, свежие сверху
-mapfile -t files < <(find "$DIR" -maxdepth 1 -type f ! -name '.*' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
-
-if [ "${#files[@]}" -eq 0 ]; then
-  notify "clip" "папка пуста: $DIR"
+if [ "${#dirs[@]}" -eq 0 ] && [ "${#files[@]}" -eq 0 ]; then
+  notify "clip" "пусто: $DIR — кидай файлы и папки сюда"
   exit 0
 fi
 
 sel="${1:-}"
-if [ "$sel" = "last" ]; then
-  f="${files[0]}"
-elif [[ "$sel" =~ ^[0-9]+$ ]]; then
-  if [ "$sel" -lt 1 ] || [ "$sel" -gt "${#files[@]}" ]; then notify "clip" "нет файла №$sel"; exit 1; fi
-  f="${files[$((sel - 1))]}"
-elif [ -n "$sel" ]; then
-  f="$DIR/$sel"
-  [ -f "$f" ] || { notify "clip" "не нашёл: $sel"; exit 1; }
-else
-  if [ "${#files[@]}" -eq 1 ]; then
-    f="${files[0]}"
-  else
-    if command -v zenity >/dev/null 2>&1; then
-      names=(); for p in "${files[@]}"; do names+=("$(basename "$p")"); done
-      pick=$(zenity --list --title="clip → буфер" --text="что скопировать в буфер?" --column="файл" "★ всё содержимое (Ctrl+Alt+A)" "${names[@]}" --width=420 --height=360) || exit 0
-    elif command -v rofi >/dev/null 2>&1; then
-      pick=$(printf '%s\n' "★ всё содержимое (Ctrl+Alt+A)" "${files[@]}" | rofi -dmenu -i -p "clip") || exit 0
-    else
-      notify "clip" "нет zenity/rofi для меню"
-      exit 1
-    fi
-    [ -n "${pick:-}" ] || exit 0
-    if [ "$pick" = "★ всё содержимое (Ctrl+Alt+A)" ]; then
-      { for f in "${files[@]}"; do cat "$f"; printf '\n'; done; } | to_clip
-      notify "clip" "склеено файлов: ${#files[@]}"
-      exit 0
-    fi
-    if [[ "$pick" = /* ]]; then f="$pick"; else f="$DIR/$pick"; fi
+case "$sel" in
+  all)
+    copy_paths "$DIR"
+    notify "clip" "скопировано всё из $(basename "$DIR")"
+    exit 0 ;;
+  last)
+    if [ "${#files[@]}" -eq 0 ]; then notify "clip" "в корне файлов нет, только папки"; exit 0; fi
+    copy_paths "${files[0]}"
+    notify "clip" "скопировано: $(basename "${files[0]}")"
+    exit 0 ;;
+esac
+
+# нумерация как в меню: сначала папки, потом файлы
+elements=("${dirs[@]}" "${files[@]}")
+if [[ "$sel" =~ ^[0-9]+$ ]]; then
+  if [ "$sel" -lt 1 ] || [ "$sel" -gt "${#elements[@]}" ]; then notify "clip" "нет элемента №$sel"; exit 1; fi
+  p="${elements[$((sel - 1))]}"
+  copy_paths "$p"
+  notify "clip" "скопировано: $(basename "$p")"
+  exit 0
+fi
+if [ -n "$sel" ]; then
+  p="$DIR/$sel"
+  if [ -f "$p" ] || [ -d "$p" ]; then
+    copy_paths "$p"
+    notify "clip" "скопировано: $sel"
+    exit 0
   fi
+  notify "clip" "не нашёл: $sel"
+  exit 1
 fi
 
-to_clip < "$f"
-notify "clip" "скопировано: $(basename "$f")"
+# интерактив: меню из папок и файлов
+labels=()
+for p in "${dirs[@]}"; do labels+=("$(basename "$p")/"); done
+for p in "${files[@]}"; do labels+=("$(basename "$p")"); done
+hint="откуда: ${DIR/#$HOME/~} — кидай файлы и папки сюда; выбор папки = склеить её содержимое"
+
+if [ "${#elements[@]}" -eq 1 ]; then
+  choice="${labels[0]}"
+else
+  if command -v zenity >/dev/null 2>&1; then
+    choice=$(zenity --list --title="clip → буфер" --text="$hint" --column="файл или папка" "★ всё содержимое (Ctrl+Alt+A)" "${labels[@]}" --width=480 --height=420) || exit 0
+  elif command -v rofi >/dev/null 2>&1; then
+    choice=$(printf '%s\n' "★ всё содержимое (Ctrl+Alt+A)" "${labels[@]}" | rofi -dmenu -i -p "clip") || exit 0
+  else
+    notify "clip" "нет zenity/rofi для меню"
+    exit 1
+  fi
+  [ -n "${choice:-}" ] || exit 0
+fi
+
+if [ "$choice" = "★ всё содержимое (Ctrl+Alt+A)" ]; then
+  copy_paths "$DIR"
+  notify "clip" "скопировано всё из $(basename "$DIR")"
+  exit 0
+fi
+
+if [[ "$choice" == */ ]]; then
+  p="$DIR/${choice%/}"
+else
+  p="$DIR/$choice"
+fi
+if [ -f "$p" ] || [ -d "$p" ]; then
+  copy_paths "$p"
+  notify "clip" "скопировано: $(basename "$p")"
+else
+  notify "clip" "не нашёл: $choice"
+  exit 1
+fi
